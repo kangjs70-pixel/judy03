@@ -1,0 +1,6 @@
+{
+  "name": "민원 든든 (Civil Service Copilot)",
+  "description": "공공기관 및 기업 민원 담당자를 위한 AI 기반 민원 맞춤 응대 문구 생성, 법령 가이드, 3줄 요약 및 개인정보 마스킹 시스템",
+  "requestFramePermissions": [],
+  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
+}
