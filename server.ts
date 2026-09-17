@@ -1,5 +1,6 @@
 import express from "express";
 import path from "path";
+import fs from "fs";
 import { createServer as createViteServer } from "vite";
 import { GoogleGenAI } from "@google/genai";
 import dotenv from "dotenv";
@@ -22,6 +23,49 @@ function getGeminiClient(): GoogleGenAI | null {
     });
   }
   return aiClient;
+}
+
+// Robust Gemini caller with automatic model fallback (3.6-flash & 3.8-flash)
+async function callGeminiSafe(
+  client: GoogleGenAI,
+  contents: string,
+  systemInstruction: string,
+  temperature = 0.3
+): Promise<string | null> {
+  const modelsToTry = ["gemini-3.6-flash", "gemini-3.8-flash"];
+  for (const model of modelsToTry) {
+    try {
+      const response = await client.models.generateContent({
+        model,
+        contents,
+        config: {
+          systemInstruction,
+          responseMimeType: "application/json",
+          temperature,
+        },
+      });
+      if (response && response.text) {
+        return response.text;
+      }
+    } catch (err: any) {
+      console.warn(`Gemini generation warning with ${model}:`, err?.message || err);
+    }
+  }
+  return null;
+}
+
+function parseJsonSafely(raw: string | null): any {
+  if (!raw) return null;
+  try {
+    let clean = raw.trim();
+    if (clean.startsWith("```")) {
+      clean = clean.replace(/^```(?:json)?\s*/i, "").replace(/\s*```$/, "");
+    }
+    return JSON.parse(clean.trim());
+  } catch (err) {
+    console.warn("Failed to parse JSON string:", err);
+    return null;
+  }
 }
 
 // Statutory knowledge base for civil affairs
@@ -154,22 +198,27 @@ ${customDirectives ? `5. 추가 요청 사항: ${customDirectives}` : ""}
 }`;
 
       if (client) {
-        const response = await client.models.generateContent({
-          model: "gemini-3.8-flash",
-          contents: `[민원 접수 원문 또는 키워드]:\n${complaintText}\n\n[추출된 핵심 키워드]: ${keywords.join(", ")}`,
-          config: {
-            systemInstruction: systemPrompt,
-            responseMimeType: "application/json",
-            temperature: 0.3,
-          },
-        });
+        const rawJson = await callGeminiSafe(
+          client,
+          `[민원 접수 원문 또는 키워드]:\n${complaintText}\n\n[추출된 핵심 키워드]: ${keywords.join(", ")}`,
+          systemPrompt,
+          0.3
+        );
 
-        const rawText = response.text || "{}";
-        try {
-          const parsed = JSON.parse(rawText);
-          return res.json(parsed);
-        } catch (parseErr) {
-          console.warn("JSON parse error from Gemini, falling back to structured fallback", parseErr);
+        if (rawJson) {
+          const parsed = parseJsonSafely(rawJson);
+          if (parsed && (parsed.generatedResponse || parsed.threeLineSummary)) {
+            return res.json({
+              threeLineSummary: parsed.threeLineSummary || ["민원 내용 확인", "법령 검토", "현장 조치 계획 안내"],
+              extractedKeywords: parsed.extractedKeywords || keywords,
+              responseTitle: parsed.responseTitle || "[회신] 접수하신 민원에 대한 처리결과 안내",
+              generatedResponse: parsed.generatedResponse || "",
+              relevantLaws: parsed.relevantLaws || [],
+              communicationTips: parsed.communicationTips || [],
+              alternativeExpressions: parsed.alternativeExpressions || [],
+              timestamp: new Date().toISOString(),
+            });
+          }
         }
       }
 
@@ -201,7 +250,6 @@ ${customDirectives ? `5. 추가 요청 사항: ${customDirectives}` : ""}
       // 1. Regular expression sensitive data detection & masking
       const rrnRegex = /\b(\d{6})[- ]?([1-4]\d{6})\b/g;
       const phoneRegex = /\b(01[016789])[- ]?(\d{3,4})[- ]?(\d{4})\b/g;
-      const accountRegex = /\b(\d{3,6})[- ]?(\d{2,6})[- ]?(\d{3,6})\b/g;
 
       let detectedPII: string[] = [];
       let maskedText = text;
@@ -217,11 +265,10 @@ ${customDirectives ? `5. 추가 요청 사항: ${customDirectives}` : ""}
 
       const client = getGeminiClient();
       if (client) {
-        const response = await client.models.generateContent({
-          model: "gemini-3.8-flash",
-          contents: `다음 민원 답변 문안을 검토하여 행정 공직자 수준의 격식 있고 정중한 문장으로 다듬고, 공격적이거나 비공식적인 어휘를 교정해주세요.\n\n[원본 문안]:\n${maskedText}`,
-          config: {
-            systemInstruction: `당신은 공공기관 민원 문서 교정 전문가입니다.
+        const rawJson = await callGeminiSafe(
+          client,
+          `다음 민원 답변 문안을 검토하여 행정 공직자 수준의 격식 있고 정중한 문장으로 다듬고, 공격적이거나 비공식적인 어휘를 교정해주세요.\n\n[원본 문안]:\n${maskedText}`,
+          `당신은 공공기관 민원 문서 교정 전문가입니다.
 감정적인 대립 표현(예: 불가능합니다, 우기지 마세요, 이전에도 말씀드렸듯이)을 신뢰감과 공감을 주는 공직 표준 언어로 순화하세요.
 결과는 JSON으로 출력하세요:
 {
@@ -232,20 +279,18 @@ ${customDirectives ? `5. 추가 요청 사항: ${customDirectives}` : ""}
   "politeScore": 95,
   "toneAssessment": "전반적인 어조 평가 요약"
 }`,
-            responseMimeType: "application/json",
-            temperature: 0.2,
-          },
-        });
+          0.2
+        );
 
-        try {
-          const result = JSON.parse(response.text || "{}");
-          return res.json({
-            ...result,
-            detectedPII,
-            isPiiMasked: detectedPII.length > 0,
-          });
-        } catch (e) {
-          // fall through
+        if (rawJson) {
+          const parsed = parseJsonSafely(rawJson);
+          if (parsed && parsed.polishedText) {
+            return res.json({
+              ...parsed,
+              detectedPII,
+              isPiiMasked: detectedPII.length > 0,
+            });
+          }
         }
       }
 
@@ -285,14 +330,16 @@ ${customDirectives ? `5. 추가 요청 사항: ${customDirectives}` : ""}
   });
 
   // Vite middleware for development vs static build in production
-  if (process.env.NODE_ENV !== "production") {
+  const distPath = path.join(process.cwd(), "dist");
+  const hasDist = fs.existsSync(path.join(distPath, "index.html"));
+
+  if (process.env.NODE_ENV !== "production" && !hasDist) {
     const vite = await createViteServer({
       server: { middlewareMode: true },
       appType: "spa",
     });
     app.use(vite.middlewares);
   } else {
-    const distPath = path.join(process.cwd(), "dist");
     app.use(express.static(distPath));
     app.get("*", (req, res) => {
       res.sendFile(path.join(distPath, "index.html"));

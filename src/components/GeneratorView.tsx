@@ -18,6 +18,7 @@ import {
 } from "lucide-react";
 import { SAMPLE_COMPLAINTS } from "../data/initialData";
 import { ToneType, ChannelType, CivilResponseData, SampleComplaint } from "../types";
+import { generateClientCivilResponse } from "../utils/civilGeneratorFallback";
 import ResponseDisplay from "./ResponseDisplay";
 
 interface GeneratorViewProps {
@@ -46,6 +47,7 @@ export default function GeneratorView({
 
   const [isLoading, setIsLoading] = useState(false);
   const [errorMsg, setErrorMsg] = useState<string | null>(null);
+  const [noticeMsg, setNoticeMsg] = useState<string | null>(null);
   const [responseData, setResponseData] = useState<CivilResponseData | null>(null);
 
   const step1Id = useId();
@@ -86,7 +88,7 @@ export default function GeneratorView({
     }
   };
 
-  // Trigger generation
+  // Trigger generation with guaranteed resilience & client fallback
   const handleGenerate = async () => {
     if (!complaintText.trim()) {
       setErrorMsg("민원 원문 또는 처리할 내용을 입력해주세요.");
@@ -95,11 +97,16 @@ export default function GeneratorView({
 
     setIsLoading(true);
     setErrorMsg(null);
+    setNoticeMsg(null);
 
     try {
+      const controller = new AbortController();
+      const timeoutId = setTimeout(() => controller.abort(), 9000);
+
       const res = await fetch("/api/generate-civil-response", {
         method: "POST",
         headers: { "Content-Type": "application/json" },
+        signal: controller.signal,
         body: JSON.stringify({
           complaintText,
           keywords,
@@ -112,15 +119,33 @@ export default function GeneratorView({
         }),
       });
 
+      clearTimeout(timeoutId);
+
       if (!res.ok) {
         throw new Error(`서버 응답 오류 (${res.status})`);
       }
 
       const data = await res.json();
-      setResponseData(data);
+      if (data && (data.generatedResponse || data.threeLineSummary)) {
+        setResponseData(data);
+      } else {
+        throw new Error("Invalid response schema");
+      }
     } catch (err: any) {
-      console.error("Generation error:", err);
-      setErrorMsg("답변 문구 생성 중 문제가 발생했습니다. 다시 시도해주세요.");
+      console.warn("서버 응답 지연/오류로 인하여 국가 표준 행정 지침 템플릿 엔진으로 즉시 대체 생성합니다:", err);
+      // Seamlessly generate response via standard statutory template engine
+      const clientResult = generateClientCivilResponse(
+        complaintText,
+        keywords,
+        tone,
+        channel,
+        department,
+        officerName,
+        includeLaw,
+        customDirectives
+      );
+      setResponseData(clientResult);
+      setNoticeMsg("안내: 네트워크 및 서버 지연 시에도 업무 지장이 없도록 국가 표준 행정 지침 템플릿 엔진으로 즉시 생성되었습니다.");
     } finally {
       setIsLoading(false);
     }
@@ -451,6 +476,22 @@ export default function GeneratorView({
 
         {/* Right Column (Results & Output Station): lg:col-span-6 */}
         <div className="lg:col-span-6 space-y-4">
+          {noticeMsg && (
+            <div className="p-3 bg-amber-50 border border-amber-200 rounded-xl text-amber-800 text-xs flex items-center justify-between gap-2 shadow-xs">
+              <div className="flex items-center gap-2">
+                <span className="w-2 h-2 rounded-full bg-amber-500 shrink-0"></span>
+                <span>{noticeMsg}</span>
+              </div>
+              <button
+                onClick={() => setNoticeMsg(null)}
+                className="text-amber-600 hover:text-amber-900 cursor-pointer p-1"
+                aria-label="알림 닫기"
+              >
+                <X className="w-3.5 h-3.5" />
+              </button>
+            </div>
+          )}
+
           {isLoading ? (
             <div className="bg-white rounded-xl border border-slate-200 p-8 text-center flex flex-col items-center justify-center min-h-[420px] shadow-xs">
               <div className="w-12 h-12 rounded-2xl bg-blue-50 text-blue-700 flex items-center justify-center mb-3 animate-pulse">
